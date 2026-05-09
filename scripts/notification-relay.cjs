@@ -687,18 +687,32 @@ function matchesSensitivity(ruleSensitivity, eventSeverity) {
  * `payload.countryCode`, ais-relay sometimes uses `payload.country`, browser-
  * submitted rss_alert events occasionally lift `country` to the event root.
  *
- * STRICT semantics: events with NO country attribution are NOT delivered to
- * a country-scoped rule. The alternative — "deliver unscoped events too" —
- * would surprise a user who set countries=['US'] expecting to see only US
- * alerts. The strict path errs on under-delivery, which is recoverable
- * (user empties the list / removes scope), vs over-delivery which trains
- * users to ignore notifications.
+ * PERMISSIVE semantics for unattributed events: when a rule has
+ * countries=['US'] and an event has NO country attribution, we deliver it.
+ * The publisher didn't give us enough information to filter, so the user
+ * receives a global alert that may or may not be about their country.
+ *
+ * RATIONALE: most publishers today (rss_alert, ais-relay generic events,
+ * etc.) do not emit a country code. Strict drop-on-missing semantics would
+ * deliver ZERO alerts to a user who set countries=['US'] — strictly worse
+ * UX than "occasional unscoped global event slips through." A user opting
+ * into country-scope expects to receive AT LEAST events from those
+ * countries; permissive delivery on unattributed events meets that
+ * expectation. As publishers add country attribution (planned follow-up
+ * audit), scoped delivery tightens automatically. A future strict-mode
+ * opt-in (e.g. rule.countriesStrict=true) is left to a follow-up UI surface.
+ *
+ * Strict semantics still apply when the event IS attributed but doesn't
+ * match: rule.countries=['US'] + event.payload.countryCode='IR' → drop.
  *
  * Country values are normalized to uppercase ISO-3166 alpha-2 before
- * matching. Malformed values (non-2-letter, multi-word names) fail the
- * regex and the event is dropped for the country-scoped rule.
+ * matching. Malformed values (non-2-letter, multi-word names like 'USA' or
+ * 'United States') fall through to the "unattributed" branch and are
+ * delivered permissively — the publisher emitted garbage, treat it as if
+ * it emitted nothing.
  */
 function eventMatchesCountryScope(event, rule) {
+  // Empty/absent countries on the rule → all events (no filter applied).
   if (!Array.isArray(rule.countries) || rule.countries.length === 0) return true;
 
   const eventCountry =
@@ -707,10 +721,14 @@ function eventMatchesCountryScope(event, rule) {
     ?? event?.country
     ?? null;
 
-  if (typeof eventCountry !== 'string') return false;
+  // Unattributed → PERMISSIVE deliver (see RATIONALE above).
+  if (typeof eventCountry !== 'string' || eventCountry.trim().length === 0) {
+    return true;
+  }
 
   const normalized = eventCountry.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(normalized)) return false;
+  // Malformed (non-2-letter) → treat as unattributed → PERMISSIVE deliver.
+  if (!/^[A-Z]{2}$/.test(normalized)) return true;
 
   return rule.countries.includes(normalized);
 }

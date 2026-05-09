@@ -7,8 +7,8 @@
  *     alongside shouldNotify, otherwise country-scoped rules would receive
  *     events from all countries (silent over-delivery).
  *  2. Behavioural: re-execute the filter logic against a synthetic rule +
- *     event matrix to lock in the strict-no-attribution semantics + country
- *     extraction priority.
+ *     event matrix to lock in the PERMISSIVE-on-unattributed semantics +
+ *     country extraction priority.
  *
  * Run: node --test tests/notification-relay-country-filter.test.mjs
  */
@@ -36,9 +36,13 @@ function eventMatchesCountryScope(event, rule) {
     ?? event?.payload?.country
     ?? event?.country
     ?? null;
-  if (typeof eventCountry !== 'string') return false;
+  // Unattributed → permissive (deliver).
+  if (typeof eventCountry !== 'string' || eventCountry.trim().length === 0) {
+    return true;
+  }
   const normalized = eventCountry.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(normalized)) return false;
+  // Malformed → permissive (deliver).
+  if (!/^[A-Z]{2}$/.test(normalized)) return true;
   return rule.countries.includes(normalized);
 }
 
@@ -71,14 +75,26 @@ describe('notification-relay eventMatchesCountryScope — source-grep contract',
     );
   });
 
-  it('strict semantics: no country attribution → returns false (NOT delivered)', () => {
-    // When rule has countries set, an event WITHOUT country attribution must
-    // NOT be delivered. Documented inline so the next reader doesn't flip
-    // this to over-deliver "for safety."
+  it('PERMISSIVE semantics: no country attribution → returns true (delivered)', () => {
+    // Documented inline so the next reader doesn't flip this back to drop
+    // "for safety." See the RATIONALE block in the relay source.
     assert.match(
       relaySrc,
-      /if\s*\(\s*typeof\s+eventCountry\s*!==\s*['"]string['"]\s*\)\s*return\s+false/,
-      'missing country attribution must return false (strict)',
+      /PERMISSIVE/,
+      'relay must document permissive-on-unattributed semantics inline',
+    );
+    assert.match(
+      relaySrc,
+      /if\s*\(\s*typeof\s+eventCountry\s*!==\s*['"]string['"]\s*\|\|\s*eventCountry\.trim\(\)\.length\s*===\s*0\s*\)\s*{[\s\S]*?return\s+true/,
+      'missing/empty country attribution must return true (permissive)',
+    );
+  });
+
+  it('malformed country (non-2-letter) → returns true (permissive, treated as unattributed)', () => {
+    assert.match(
+      relaySrc,
+      /if\s*\(\s*!\/\^\[A-Z\]\{2\}\$\/\.test\(normalized\)\s*\)\s*return\s+true/,
+      'malformed country must return true (permissive)',
     );
   });
 
@@ -104,14 +120,35 @@ describe('notification-relay eventMatchesCountryScope — behavioural', () => {
     assert.equal(eventMatchesCountryScope(event, { countries: ['US', 'GB'] }), true);
   });
 
-  it("rule.countries=['US'] + event.payload.country='IR' → false", () => {
+  it("rule.countries=['US'] + event.payload.country='IR' → false (strict for attributed mismatch)", () => {
+    // Strict for events that ARE attributed but don't match — those are
+    // events the publisher unambiguously labelled as a different country.
     const event = { eventType: 'rss_alert', payload: { country: 'IR' } };
     assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), false);
   });
 
-  it("rule.countries=['US'] + event with NO country attribution → false (strict)", () => {
+  it("rule.countries=['US'] + event.payload.country='US' → true (attributed match)", () => {
+    const event = { eventType: 'rss_alert', payload: { country: 'US' } };
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
+  });
+
+  it("rule.countries=['US'] + event with NO country attribution → true (permissive)", () => {
+    // PERMISSIVE: when the publisher gives no country info, deliver. Most
+    // current publishers (rss_alert, ais-relay generic events) don't attribute,
+    // so dropping these would mean ZERO alerts for a user who set
+    // countries=['US'] — worse UX than over-delivery.
     const event = { eventType: 'rss_alert', payload: { title: 'something' } };
-    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), false);
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
+  });
+
+  it("rule.countries=['US'] + event.payload.country='' (empty string) → true (permissive)", () => {
+    const event = { eventType: 'rss_alert', payload: { country: '' } };
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
+  });
+
+  it("rule.countries=['US'] + event.payload.country='   ' (whitespace) → true (permissive)", () => {
+    const event = { eventType: 'rss_alert', payload: { country: '   ' } };
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
   });
 
   it("rule.countries=['US'] + event.payload.countryCode='us' (lowercase) → true (normalized)", () => {
@@ -119,14 +156,14 @@ describe('notification-relay eventMatchesCountryScope — behavioural', () => {
     assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
   });
 
-  it("rule.countries=['US'] + malformed country 'USA' (3 letters) → false", () => {
+  it("rule.countries=['US'] + malformed country 'USA' (3 letters) → true (permissive, malformed=unattributed)", () => {
     const event = { eventType: 'rss_alert', payload: { country: 'USA' } };
-    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), false);
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
   });
 
-  it("rule.countries=['US'] + malformed country 'United States' → false", () => {
+  it("rule.countries=['US'] + malformed country 'United States' → true (permissive, malformed=unattributed)", () => {
     const event = { eventType: 'rss_alert', payload: { country: 'United States' } };
-    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), false);
+    assert.equal(eventMatchesCountryScope(event, { countries: ['US'] }), true);
   });
 
   it('extraction priority: payload.countryCode wins over payload.country', () => {

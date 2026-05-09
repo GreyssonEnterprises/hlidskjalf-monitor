@@ -427,7 +427,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         loadingEl.style.display = 'block';
         contentEl.style.display = 'none';
         if (signal.aborted) return;
-        getChannelsData().then(async (data) => {
+        getChannelsData().then((data) => {
           if (signal.aborted) return;
           contentEl.innerHTML = renderNotifContent(data);
           loadingEl.style.display = 'none';
@@ -463,7 +463,7 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
             if (preselectCountry) {
               initial = [preselectCountry];
             } else {
-              const followed = await loadFollowedCountriesSafe();
+              const followed = loadFollowedCountriesSafe();
               if (followed.length > 0) initial = followed;
             }
           }
@@ -485,45 +485,71 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         });
       }
 
-      // Read all current alert-rule fields off the DOM and POST through the
-      // existing saveAlertRules pipeline (forwards `countries` per the
-      // notification-channels API contract).
-      function saveCurrentAlertRule(): void {
+      /**
+       * Centralized snapshot of the live alert-rule form state.
+       *
+       * EVERY alertRules save path in this file MUST source its payload from
+       * this helper (or augment its return value with overrides) — bypassing
+       * it risks dropping `countries` (the picker value lives outside the
+       * form's input elements) or any future field added to AlertRule.
+       *
+       * Why a helper instead of inlining `countries: countryPicker?.getValue()`
+       * at every call site: each save handler historically reconstructed the
+       * payload from scratch, and the picker value was easy to forget. PR
+       * #3632 review surfaced one missed call site (channel-connect saves);
+       * centralizing makes future drift impossible to introduce silently.
+       */
+      function getCurrentAlertRuleFormState(): {
+        enabled: boolean;
+        eventTypes: string[];
+        sensitivity: 'all' | 'high' | 'critical';
+        channels: ChannelType[];
+        aiDigestEnabled: boolean;
+        countries: string[] | undefined;
+      } {
         const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
         const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
         const aiDigestEl = container.querySelector<HTMLInputElement>('#usAiDigestEnabled');
-        const enabled = enabledEl?.checked ?? false;
-        const sensitivity = (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical';
         const connectedChannelTypes = Array.from(
           container.querySelectorAll<HTMLElement>('[data-channel-type]'),
         )
           .filter(el => el.classList.contains('us-notif-ch-on'))
           .map(el => el.dataset.channelType as ChannelType);
-        void saveAlertRules({
-          variant: SITE_VARIANT,
-          enabled,
+        return {
+          enabled: enabledEl?.checked ?? false,
           eventTypes: [],
-          sensitivity,
+          sensitivity: (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical',
           channels: connectedChannelTypes,
           aiDigestEnabled: aiDigestEl?.checked ?? true,
+          // The picker is mounted asynchronously after reloadNotifSection
+          // resolves; if it hasn't mounted yet we send undefined so the
+          // server preserves the existing stored value (preserve-on-omit).
           countries: countryPicker ? countryPicker.getValue() : undefined,
+        };
+      }
+
+      // Read all current alert-rule fields off the DOM and POST through the
+      // existing saveAlertRules pipeline. Sources its full payload from
+      // getCurrentAlertRuleFormState so `countries` flows through every time.
+      function saveCurrentAlertRule(): void {
+        const state = getCurrentAlertRuleFormState();
+        void saveAlertRules({
+          variant: SITE_VARIANT,
+          ...state,
         });
       }
 
       reloadNotifSection();
 
       function saveRuleWithNewChannel(newChannel: ChannelType): void {
-        const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
-        const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
-        if (!enabledEl) return;
-        const enabled = enabledEl.checked;
-        const sensitivity = (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical';
-        const existing = Array.from(container.querySelectorAll<HTMLElement>('[data-channel-type]'))
-          .filter(el => el.classList.contains('us-notif-ch-on'))
-          .map(el => el.dataset.channelType as ChannelType);
-        const channels = [...new Set([...existing, newChannel])];
-        const aiEl = container.querySelector<HTMLInputElement>('#usAiDigestEnabled');
-        void saveAlertRules({ variant: SITE_VARIANT, enabled, eventTypes: [], sensitivity, channels, aiDigestEnabled: aiEl?.checked ?? true });
+        const state = getCurrentAlertRuleFormState();
+        // Augment channels with the newly connected one (set semantics).
+        const channels = [...new Set([...state.channels, newChannel])];
+        void saveAlertRules({
+          variant: SITE_VARIANT,
+          ...state,
+          channels,
+        });
       }
 
       signal.addEventListener('abort', () => {
@@ -684,21 +710,14 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         if (target.id === 'usAiDigestEnabled') {
           if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
           alertRuleDebounceTimer = setTimeout(() => {
-            const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
-            const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
-            const enabled = enabledEl?.checked ?? false;
-            const sensitivity = (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical';
-            const connectedChannelTypes = Array.from(
-              container.querySelectorAll<HTMLElement>('[data-channel-type]'),
-            )
-              .filter(el => el.classList.contains('us-notif-ch-on'))
-              .map(el => el.dataset.channelType as ChannelType);
+            // Source from the centralized helper so `countries` flows through.
+            // Override aiDigestEnabled with the just-toggled value (the helper
+            // reads from the DOM, which has already been updated by the time
+            // the debounce fires, but explicit override avoids any race).
+            const state = getCurrentAlertRuleFormState();
             void saveAlertRules({
               variant: SITE_VARIANT,
-              enabled,
-              eventTypes: [],
-              sensitivity,
-              channels: connectedChannelTypes,
+              ...state,
               aiDigestEnabled: target.checked,
             });
           }, 500);
@@ -707,23 +726,11 @@ export function renderNotificationsSettings(host: NotificationsSettingsHost): No
         if (target.id === 'usNotifEnabled' || target.id === 'usNotifSensitivity') {
           if (alertRuleDebounceTimer) clearTimeout(alertRuleDebounceTimer);
           alertRuleDebounceTimer = setTimeout(() => {
-            const enabledEl = container.querySelector<HTMLInputElement>('#usNotifEnabled');
-            const sensitivityEl = container.querySelector<HTMLSelectElement>('#usNotifSensitivity');
-            const enabled = enabledEl?.checked ?? false;
-            const sensitivity = (sensitivityEl?.value ?? 'all') as 'all' | 'high' | 'critical';
-            const connectedChannelTypes = Array.from(
-              container.querySelectorAll<HTMLElement>('[data-channel-type]'),
-            )
-              .filter(el => el.classList.contains('us-notif-ch-on'))
-              .map(el => el.dataset.channelType as ChannelType);
-            const aiDigestEl = container.querySelector<HTMLInputElement>('#usAiDigestEnabled');
+            // Source from the centralized helper so `countries` flows through.
+            const state = getCurrentAlertRuleFormState();
             void saveAlertRules({
               variant: SITE_VARIANT,
-              enabled,
-              eventTypes: [],
-              sensitivity,
-              channels: connectedChannelTypes,
-              aiDigestEnabled: aiDigestEl?.checked ?? true,
+              ...state,
             });
           }, 1000);
         }

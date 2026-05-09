@@ -3,10 +3,12 @@
  *
  * Two test surfaces:
  *  1. Source-grep on src/services/notifications-settings.ts: the picker is
- *     mounted, smart-default uses dynamic import, edit-existing respects
- *     stored countries, save flow forwards `countries`.
+ *     mounted, smart-default reads from the window registry, edit-existing
+ *     respects stored countries, EVERY alertRules save path sources its
+ *     payload from the centralized getCurrentAlertRuleFormState helper.
  *  2. Behavioural unit tests on the pure helpers
- *     (normalizeIso2, mountCountryChipPicker via a minimal DOM stub).
+ *     (normalizeIso2, mountCountryChipPicker via a minimal DOM stub,
+ *     loadFollowedCountriesSafe via a window-registry stub).
  *
  * No JSDOM dependency: we hand-roll a tiny element stub sufficient to drive
  * the picker's render + click logic. Keeps the test footprint small and
@@ -16,7 +18,7 @@
  * Run: tsx --test tests/notifications-settings-country-picker.test.mts
  */
 
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
@@ -25,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import {
   normalizeIso2,
   mountCountryChipPicker,
+  loadFollowedCountriesSafe,
 } from '../src/utils/country-chip-picker.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -71,14 +74,6 @@ describe('notifications-settings.ts — country picker integration', () => {
       settingsSrc,
       /if\s*\(\s*isNewRule\s*\)\s*{[\s\S]*?loadFollowedCountriesSafe/,
       'loadFollowedCountriesSafe must be inside the isNewRule branch',
-    );
-  });
-
-  it('saveCurrentAlertRule forwards countries from the picker', () => {
-    assert.match(
-      settingsSrc,
-      /countries:\s*countryPicker\s*\?\s*countryPicker\.getValue\(\)\s*:\s*undefined/,
-      'saveCurrentAlertRule must forward picker.getValue() as countries',
     );
   });
 
@@ -149,28 +144,138 @@ describe('notifications-settings.ts — country picker integration', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Source-grep contract — country-chip-picker.ts
+// Source-grep contract — centralized save-path helper (countries thread-through)
 // ---------------------------------------------------------------------------
 
-describe('country-chip-picker.ts — dynamic import + degradation', () => {
-  it('uses dynamic import via a string variable + /* @vite-ignore */ for graceful degradation', () => {
-    // Critical for shipping independently of PR A: Vite must not statically
-    // resolve @/services/followed-countries (it doesn't exist on this branch).
+describe('notifications-settings.ts — centralized save state (countries thread-through)', () => {
+  it('declares getCurrentAlertRuleFormState helper', () => {
+    assert.match(
+      settingsSrc,
+      /function\s+getCurrentAlertRuleFormState\s*\(/,
+      'must declare getCurrentAlertRuleFormState helper',
+    );
+  });
+
+  it('helper sources `countries` from countryPicker.getValue() (with undefined fallback)', () => {
+    assert.match(
+      settingsSrc,
+      /countries:\s*countryPicker\s*\?\s*countryPicker\.getValue\(\)\s*:\s*undefined/,
+      'getCurrentAlertRuleFormState must read countries from picker',
+    );
+  });
+
+  it('saveCurrentAlertRule uses getCurrentAlertRuleFormState (debounced picker save)', () => {
+    assert.match(
+      settingsSrc,
+      /function\s+saveCurrentAlertRule\s*\(\)[\s\S]*?const\s+state\s*=\s*getCurrentAlertRuleFormState\(\)[\s\S]*?saveAlertRules\(/,
+      'saveCurrentAlertRule must source payload from getCurrentAlertRuleFormState',
+    );
+  });
+
+  it('saveRuleWithNewChannel uses getCurrentAlertRuleFormState (channel-connect save path)', () => {
+    // This is the call site that R2 found — connecting a channel raced the
+    // debounced picker save and dropped countries.
+    assert.match(
+      settingsSrc,
+      /function\s+saveRuleWithNewChannel[\s\S]*?const\s+state\s*=\s*getCurrentAlertRuleFormState\(\)[\s\S]*?saveAlertRules\(/,
+      'saveRuleWithNewChannel must source payload from getCurrentAlertRuleFormState',
+    );
+  });
+
+  it('AI digest toggle save path uses getCurrentAlertRuleFormState', () => {
+    // The usAiDigestEnabled change handler used to hand-roll its own payload
+    // and silently dropped countries. Centralized via the helper.
+    assert.match(
+      settingsSrc,
+      /target\.id\s*===\s*'usAiDigestEnabled'[\s\S]*?const\s+state\s*=\s*getCurrentAlertRuleFormState\(\)[\s\S]*?saveAlertRules\(/,
+      'AI digest toggle save must source payload from getCurrentAlertRuleFormState',
+    );
+  });
+
+  it('enable + sensitivity save path uses getCurrentAlertRuleFormState', () => {
+    // The combined usNotifEnabled / usNotifSensitivity change handler used
+    // to hand-roll its own payload and silently dropped countries.
+    assert.match(
+      settingsSrc,
+      /target\.id\s*===\s*'usNotifEnabled'\s*\|\|\s*target\.id\s*===\s*'usNotifSensitivity'[\s\S]*?const\s+state\s*=\s*getCurrentAlertRuleFormState\(\)[\s\S]*?saveAlertRules\(/,
+      'enable/sensitivity save must source payload from getCurrentAlertRuleFormState',
+    );
+  });
+
+  it('NO save path hand-rolls its own AlertRule payload (every saveAlertRules call must spread `state`)', () => {
+    // Catch future drift: any direct `saveAlertRules({` block that lists
+    // `enabled, eventTypes, sensitivity, channels, aiDigestEnabled` without
+    // `...state` is a regression of the centralization fix.
+    //
+    // Match every saveAlertRules invocation; each must contain `...state`.
+    const calls = settingsSrc.match(/saveAlertRules\(\{[\s\S]*?\}\)/g) ?? [];
+    assert.ok(calls.length >= 4, `expected ≥4 saveAlertRules call sites, found ${calls.length}`);
+    for (const call of calls) {
+      assert.match(
+        call,
+        /\.\.\.state/,
+        `saveAlertRules call must spread getCurrentAlertRuleFormState() result via ...state — found:\n${call}`,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Source-grep contract — country-chip-picker.ts (window-registry pattern)
+// ---------------------------------------------------------------------------
+
+describe('country-chip-picker.ts — window-registry pattern (no dynamic import)', () => {
+  it('reads from window.__wmFollowedCountries instead of dynamic-importing PR A', () => {
+    // The window-registry pattern decouples PR A and PR #3632 shipping
+    // cadence: PR A self-registers, PR #3632 reads-if-present. No Vite
+    // alias coupling, no @vite-ignore tricks.
     assert.match(
       pickerSrc,
-      /\/\*\s*@vite-ignore\s*\*\//,
-      'loadFollowedCountriesSafe must use /* @vite-ignore */ to skip static analysis',
+      /window\.__wmFollowedCountries|__wmFollowedCountries/,
+      'loadFollowedCountriesSafe must read from window.__wmFollowedCountries',
     );
-    assert.match(
+  });
+
+  it('does NOT use dynamic import for followed-countries (legacy approach removed)', () => {
+    // The legacy approach used `import(/* @vite-ignore */ path)` which
+    // leaves the unresolvable `@/services/followed-countries` alias in the
+    // browser bundle. We replaced it with the window-registry pattern.
+    assert.doesNotMatch(
+      pickerSrc,
+      /import\s*\(\s*\/\*\s*@vite-ignore\s*\*\/\s*path\s*\)/,
+      'must not use legacy dynamic-import-with-@vite-ignore approach',
+    );
+    assert.doesNotMatch(
       pickerSrc,
       /const\s+path\s*=\s*['"]@\/services\/followed-countries['"]/,
-      'dynamic import target must be assigned to a variable so the bundler does not eagerly resolve it',
+      'must not stash followed-countries alias in a string variable',
     );
-    // The catch path returning [] is what makes this graceful.
+  });
+
+  it('loadFollowedCountriesSafe is synchronous (no async / no Promise return)', () => {
+    // The function signature was changed from `async function` /
+    // `Promise<string[]>` to a synchronous `string[]` return so callers
+    // don't need to await. This avoids accidentally serializing first paint
+    // on a cache hit.
     assert.match(
       pickerSrc,
-      /\.catch\(\s*\(\s*\)\s*=>\s*null\s*\)/,
-      'failed import must resolve to null (then short-circuit to [])',
+      /export\s+function\s+loadFollowedCountriesSafe\s*\(\s*\)\s*:\s*string\[\]/,
+      'loadFollowedCountriesSafe must be synchronous and return string[]',
+    );
+    assert.doesNotMatch(
+      pickerSrc,
+      /export\s+async\s+function\s+loadFollowedCountriesSafe/,
+      'must not be async',
+    );
+  });
+
+  it('caller does NOT await the synchronous helper', () => {
+    // notifications-settings.ts must call it synchronously. If the call site
+    // still awaits, it's a leftover from the dynamic-import era.
+    assert.doesNotMatch(
+      settingsSrc,
+      /await\s+loadFollowedCountriesSafe/,
+      'caller must not await the synchronous helper',
     );
   });
 });
@@ -201,6 +306,66 @@ describe('normalizeIso2', () => {
     assert.equal(normalizeIso2('US123'), null);
     assert.equal(normalizeIso2('United States'), null);
     assert.equal(normalizeIso2('1A'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Behavioural — loadFollowedCountriesSafe (window registry)
+// ---------------------------------------------------------------------------
+
+describe('loadFollowedCountriesSafe — window-registry stub', () => {
+  // The picker module reads `window.__wmFollowedCountries` at call time;
+  // we mutate `globalThis.window` per-test to drive the registry.
+  const originalWindow = (globalThis as { window?: unknown }).window;
+
+  beforeEach(() => {
+    (globalThis as { window?: unknown }).window = {};
+  });
+
+  afterEach(() => {
+    if (originalWindow === undefined) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    }
+  });
+
+  it('returns [] when window.__wmFollowedCountries is absent (PR A not loaded)', () => {
+    // Default degraded behavior — picker shows nothing pre-checked.
+    assert.deepEqual(loadFollowedCountriesSafe(), []);
+  });
+
+  it('returns the registry value when PR A self-registered', () => {
+    (globalThis as { window: { __wmFollowedCountries?: unknown } }).window.__wmFollowedCountries = {
+      getFollowed: () => ['US', 'GB'],
+    };
+    assert.deepEqual(loadFollowedCountriesSafe(), ['US', 'GB']);
+  });
+
+  it('normalizes registry values (lowercase → uppercase, trim, drop bad shapes)', () => {
+    (globalThis as { window: { __wmFollowedCountries?: unknown } }).window.__wmFollowedCountries = {
+      getFollowed: () => ['us', '  GB  ', 'United States', 'Z'],
+    };
+    assert.deepEqual(loadFollowedCountriesSafe(), ['US', 'GB']);
+  });
+
+  it('returns [] when getFollowed throws', () => {
+    (globalThis as { window: { __wmFollowedCountries?: unknown } }).window.__wmFollowedCountries = {
+      getFollowed: () => { throw new Error('boom'); },
+    };
+    assert.deepEqual(loadFollowedCountriesSafe(), []);
+  });
+
+  it('returns [] when getFollowed returns a non-array', () => {
+    (globalThis as { window: { __wmFollowedCountries?: unknown } }).window.__wmFollowedCountries = {
+      getFollowed: () => 'not-an-array',
+    };
+    assert.deepEqual(loadFollowedCountriesSafe(), []);
+  });
+
+  it('returns [] when getFollowed is missing', () => {
+    (globalThis as { window: { __wmFollowedCountries?: unknown } }).window.__wmFollowedCountries = {};
+    assert.deepEqual(loadFollowedCountriesSafe(), []);
   });
 });
 

@@ -181,28 +181,46 @@ export function mountCountryChipPicker(
 
 /**
  * Try to seed the picker's initial value from the followed-countries
- * primitive (PR A). Dynamic import via a string variable so the bundler
- * doesn't statically resolve the module — when PR A hasn't shipped, the
- * import rejects at runtime and we degrade to an empty array.
+ * primitive (PR A) via a window-registry pattern.
  *
- * The `/* @vite-ignore *\/` is critical: without it Vite's static analyzer
- * tries to resolve the path at build time and fails when PR A is absent.
+ * When PR A's followed-countries module is loaded by the app, it self-
+ * registers on `window.__wmFollowedCountries`. This picker reads from that
+ * registry at runtime — no static or dynamic import, no Vite alias coupling,
+ * no `@vite-ignore` tricks. PR A and PR #3632 ship independently and
+ * integrate when both deploy.
  *
- * Kept separate from `mountCountryChipPicker` because:
- *  - Smart-default ONLY applies on NEW-rule create.
- *  - Editing an existing rule must respect the user's explicit `countries`.
- *  - Tests can mock the import boundary.
+ * Why window-registry over dynamic import:
+ *   - `import(path)` with `@vite-ignore` and a string-variable specifier
+ *     leaves the raw `@/services/followed-countries` alias in the browser
+ *     bundle. The browser then rejects the module URL because the alias is
+ *     a Vite build-time concept, not a real path.
+ *   - A registry decouples shipping cadence: PR A self-registers in its own
+ *     module-init block; PR #3632 reads if-present.
+ *
+ * Synchronous (no async): callers do not `await` this.
+ *
+ * Smart-default ONLY applies on NEW-rule create — kept separate from
+ * `mountCountryChipPicker` so editing an existing rule respects the user's
+ * explicit `countries`.
  */
-export async function loadFollowedCountriesSafe(): Promise<string[]> {
+interface FollowedCountriesRegistry {
+  getFollowed?: () => unknown;
+}
+
+export function loadFollowedCountriesSafe(): string[] {
   try {
-    const path = '@/services/followed-countries';
-    const mod = await import(/* @vite-ignore */ path).catch(() => null);
-    if (!mod || typeof (mod as { getFollowed?: unknown }).getFollowed !== 'function') {
+    const reg = (typeof window !== 'undefined')
+      ? (window as { __wmFollowedCountries?: FollowedCountriesRegistry }).__wmFollowedCountries
+      : null;
+    if (!reg || typeof reg.getFollowed !== 'function') {
       return [];
     }
-    const followed = await (mod as { getFollowed: () => Promise<string[]> | string[] }).getFollowed();
-    if (!Array.isArray(followed)) return [];
-    return followed.map(normalizeIso2).filter((c): c is string => c !== null);
+    const result = reg.getFollowed();
+    if (!Array.isArray(result)) return [];
+    return result
+      .filter((c): c is string => typeof c === 'string')
+      .map(normalizeIso2)
+      .filter((c): c is string => c !== null);
   } catch {
     return [];
   }
