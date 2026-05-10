@@ -82,11 +82,18 @@ export interface RequestEvent {
   auth_kind: AuthKind;
   tier: number;
   country: string | null;
+  ip_city: string | null;
+  ip_region: string | null;
   execution_region: string | null;
   execution_plane: ExecutionPlane;
   origin_kind: OriginKind | null;
   cache_tier: CacheTier | null;
+  ip: string | null;
+  user_agent: string | null;
   ua_hash: string | null;
+  referer: string | null;
+  accept_language: string | null;
+  host: string | null;
   sentry_trace_id: string | null;
   reason: RequestReason;
 }
@@ -126,11 +133,18 @@ export function buildRequestEvent(p: {
   authKind: AuthKind;
   tier: number;
   country: string | null;
+  ipCity: string | null;
+  ipRegion: string | null;
   executionRegion: string | null;
   executionPlane: ExecutionPlane;
   originKind: OriginKind | null;
   cacheTier: CacheTier | null;
+  ip: string | null;
+  userAgent: string | null;
   uaHash: string | null;
+  referer: string | null;
+  acceptLanguage: string | null;
+  host: string | null;
   sentryTraceId: string | null;
   reason: RequestReason;
 }): RequestEvent {
@@ -150,11 +164,18 @@ export function buildRequestEvent(p: {
     auth_kind: p.authKind,
     tier: p.tier,
     country: p.country,
+    ip_city: p.ipCity,
+    ip_region: p.ipRegion,
     execution_region: p.executionRegion,
     execution_plane: p.executionPlane,
     origin_kind: p.originKind,
     cache_tier: p.cacheTier,
+    ip: p.ip,
+    user_agent: p.userAgent,
     ua_hash: p.uaHash,
+    referer: p.referer,
+    accept_language: p.acceptLanguage,
+    host: p.host,
     sentry_trace_id: p.sentryTraceId,
     reason: p.reason,
   };
@@ -211,6 +232,53 @@ export function deriveCountry(req: Request): string | null {
     req.headers.get('cf-ipcountry') ??
     null
   );
+}
+
+export function deriveIpCity(req: Request): string | null {
+  const raw = req.headers.get('x-vercel-ip-city');
+  if (!raw) return null;
+  // Vercel URL-encodes city names with spaces ("New%20York").
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+export function deriveIpRegion(req: Request): string | null {
+  return req.headers.get('x-vercel-ip-country-region') ?? null;
+}
+
+// Client IP. Order matches Vercel's documented precedence; cf-connecting-ip is
+// only present when the request transited Cloudflare, x-forwarded-for is the
+// last-resort hop list (first entry is the originating client).
+export function deriveIp(req: Request): string | null {
+  const real = req.headers.get('x-real-ip');
+  if (real) return real;
+  const cf = req.headers.get('cf-connecting-ip');
+  if (cf) return cf;
+  const xff = req.headers.get('x-forwarded-for');
+  if (xff) {
+    const first = xff.split(',')[0]?.trim();
+    if (first) return first;
+  }
+  return null;
+}
+
+export function deriveUserAgent(req: Request): string | null {
+  return req.headers.get('user-agent') ?? null;
+}
+
+export function deriveReferer(req: Request): string | null {
+  return req.headers.get('referer') ?? null;
+}
+
+export function deriveAcceptLanguage(req: Request): string | null {
+  return req.headers.get('accept-language') ?? null;
+}
+
+export function deriveHost(req: Request): string | null {
+  return req.headers.get('host') ?? null;
 }
 
 export function deriveReqBytes(req: Request): number {
