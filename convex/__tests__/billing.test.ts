@@ -320,6 +320,83 @@ describe("payments billing repairCustomerFromSubscriptionPayload", () => {
     expect(stillOriginal?.userId).toBe("user_other_owner");
   });
 
+  test("patches existing customers row that lacks dodoCustomerId instead of inserting a duplicate", async () => {
+    // Greptile P1 — a customers row can exist for this userId without a
+    // dodoCustomerId (the field is v.optional). Repair must update the
+    // existing row, NOT insert a second one that getCustomerByUserId's
+    // .first() would silently shadow.
+    const t = convexTest(schema, modules);
+
+    const existingId = await t.run(async (ctx) =>
+      ctx.db.insert("customers", {
+        userId: TEST_USER_ID,
+        // dodoCustomerId intentionally omitted (v.optional schema state)
+        email: "old@example.com",
+        normalizedEmail: "old@example.com",
+        createdAt: NOW - DAY_MS,
+        updatedAt: NOW - DAY_MS,
+      }),
+    );
+
+    await seedSubscription(t, {
+      planKey: "pro_annual",
+      dodoProductId: PRODUCT_CATALOG.pro_annual.dodoProductId!,
+      status: "active",
+      currentPeriodEnd: NOW + 30 * DAY_MS,
+      suffix: "repair_patches_existing",
+      rawPayload: {
+        customer: { customer_id: "cus_patched_001", email: "fresh@example.com" },
+      },
+    });
+
+    const result = await t.mutation(
+      internal.payments.billing.repairCustomerFromSubscriptionPayload,
+      { userId: TEST_USER_ID },
+    );
+
+    expect(result?._id).toBe(existingId);
+    expect(result?.dodoCustomerId).toBe("cus_patched_001");
+    expect(result?.email).toBe("fresh@example.com");
+
+    // Exactly ONE customers row for this user — duplicate-avoidance verified.
+    const rowsForUser = await t.run(async (ctx) =>
+      ctx.db
+        .query("customers")
+        .withIndex("by_userId", (q) => q.eq("userId", TEST_USER_ID))
+        .collect(),
+    );
+    expect(rowsForUser.length).toBe(1);
+  });
+
+  test("does NOT blank out a pre-existing email when payload email is missing", async () => {
+    const t = convexTest(schema, modules);
+    await t.run(async (ctx) =>
+      ctx.db.insert("customers", {
+        userId: TEST_USER_ID,
+        email: "keep@example.com",
+        normalizedEmail: "keep@example.com",
+        createdAt: NOW - DAY_MS,
+        updatedAt: NOW - DAY_MS,
+      }),
+    );
+    await seedSubscription(t, {
+      planKey: "pro_annual",
+      dodoProductId: PRODUCT_CATALOG.pro_annual.dodoProductId!,
+      status: "active",
+      currentPeriodEnd: NOW + 30 * DAY_MS,
+      suffix: "repair_preserves_email",
+      rawPayload: { customer: { customer_id: "cus_emailless" } },
+    });
+
+    const result = await t.mutation(
+      internal.payments.billing.repairCustomerFromSubscriptionPayload,
+      { userId: TEST_USER_ID },
+    );
+    expect(result?.dodoCustomerId).toBe("cus_emailless");
+    expect(result?.email).toBe("keep@example.com");
+    expect(result?.normalizedEmail).toBe("keep@example.com");
+  });
+
   test("ignores non-string customer_id values (defensive)", async () => {
     const t = convexTest(schema, modules);
     await seedSubscription(t, {
@@ -435,6 +512,51 @@ describe("payments billing backfillMissingCustomers", () => {
         .first(),
     );
     expect(cCustomer).toBeNull();
+  });
+
+  test("patches an existing customers row that lacks dodoCustomerId instead of inserting a duplicate", async () => {
+    // Greptile P1 (backfill path): same duplicate-avoidance contract as
+    // the portal-open repair — when the outer `existing` lookup finds a
+    // row without dodoCustomerId, patch it rather than inserting.
+    const t = convexTest(schema, modules);
+
+    const existingId = await t.run(async (ctx) =>
+      ctx.db.insert("customers", {
+        userId: "user_backfill_patch",
+        // dodoCustomerId intentionally omitted
+        email: "stale@example.com",
+        normalizedEmail: "stale@example.com",
+        createdAt: NOW - DAY_MS,
+        updatedAt: NOW - DAY_MS,
+      }),
+    );
+
+    await seedSubscription(t, {
+      planKey: "pro_annual",
+      dodoProductId: PRODUCT_CATALOG.pro_annual.dodoProductId!,
+      status: "active",
+      currentPeriodEnd: NOW + 30 * DAY_MS,
+      suffix: "backfill_patch",
+      userId: "user_backfill_patch",
+      rawPayload: { customer: { customer_id: "cus_backfill_patch", email: "n@example.com" } },
+    });
+
+    const summary = await t.mutation(
+      internal.payments.billing.backfillMissingCustomers,
+      {},
+    );
+    expect(summary).toMatchObject({ repaired: 1, alreadyHadCustomer: 0 });
+
+    const rows = await t.run(async (ctx) =>
+      ctx.db
+        .query("customers")
+        .withIndex("by_userId", (q) => q.eq("userId", "user_backfill_patch"))
+        .collect(),
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]?._id).toBe(existingId);
+    expect(rows[0]?.dodoCustomerId).toBe("cus_backfill_patch");
+    expect(rows[0]?.email).toBe("n@example.com");
   });
 
   test("is idempotent — second pass reports zero new repairs", async () => {

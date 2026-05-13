@@ -157,8 +157,7 @@ export function prereserveBillingPortalTab(): Window | null {
 
 export type OpenBillingPortalOutcome =
   | { outcome: 'opened'; url: string }
-  | { outcome: 'no-customer' }
-  | { outcome: 'error' };
+  | { outcome: 'no-customer' };
 
 export async function openBillingPortal(
   preopened?: Window | null,

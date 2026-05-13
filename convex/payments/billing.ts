@@ -234,26 +234,47 @@ export const repairCustomerFromSubscriptionPayload = internalMutation({
       const normalizedEmail = email.trim().toLowerCase();
       const now = Date.now();
 
-      // If a customers row with this dodoCustomerId already exists for a
-      // DIFFERENT userId, don't auto-overwrite — that's a cross-user
-      // integrity issue (one Dodo customer mapped to two Clerk users)
-      // that deserves manual triage, not silent repair.
-      const existing = await ctx.db
+      // Cross-user collision check: if a customers row with this
+      // dodoCustomerId already exists for a DIFFERENT userId, don't
+      // auto-overwrite — that's a cross-user integrity issue (one Dodo
+      // customer mapped to two Clerk users) that deserves manual triage.
+      const collidingByDodo = await ctx.db
         .query("customers")
         .withIndex("by_dodoCustomerId", (q) => q.eq("dodoCustomerId", dodoCustomerId))
         .first();
-      if (existing) {
-        if (existing.userId !== args.userId) {
-          console.warn(
-            `[billing/repair] customers.dodoCustomerId=${dodoCustomerId} already mapped to userId=${existing.userId}; refusing to remap to userId=${args.userId}.`,
-          );
-          return null;
-        }
-        return existing;
+      if (collidingByDodo && collidingByDodo.userId !== args.userId) {
+        console.warn(
+          `[billing/repair] customers.dodoCustomerId=${dodoCustomerId} already mapped to userId=${collidingByDodo.userId}; refusing to remap to userId=${args.userId}.`,
+        );
+        return null;
+      }
+
+      // by_userId precedence: a row may already exist for this user
+      // WITHOUT a dodoCustomerId (the field is `v.optional(v.string())`
+      // so a null/missing value is a valid pre-existing schema state).
+      // In that case, PATCH the existing row instead of inserting a
+      // second one — `getCustomerByUserId` uses `.first()` defensively,
+      // so a duplicate row would be a silent orphan. Greptile P1 review.
+      const existingByUser = await ctx.db
+        .query("customers")
+        .withIndex("by_userId", (q) => q.eq("userId", args.userId))
+        .first();
+      if (existingByUser) {
+        console.warn(
+          `[billing/repair] Patching dodoCustomerId=${dodoCustomerId} into existing customers row for userId=${args.userId} (dodoSubscriptionId=${sub.dodoSubscriptionId}). Webhook gap — investigate subscriptionHelpers.ts:520-549.`,
+        );
+        await ctx.db.patch(existingByUser._id, {
+          dodoCustomerId,
+          // Only refresh email/normalizedEmail when payload supplied one;
+          // never blank out a previously-populated value.
+          ...(email ? { email, normalizedEmail } : {}),
+          updatedAt: now,
+        });
+        return await ctx.db.get(existingByUser._id);
       }
 
       console.warn(
-        `[billing/repair] Repairing missing customers row for userId=${args.userId} from subscription rawPayload (dodoSubscriptionId=${sub.dodoSubscriptionId}). Webhook gap — investigate subscriptionHelpers.ts:520-549.`,
+        `[billing/repair] Inserting customers row for userId=${args.userId} from subscription rawPayload (dodoSubscriptionId=${sub.dodoSubscriptionId}). Webhook gap — investigate subscriptionHelpers.ts:520-549.`,
       );
       const insertedId = await ctx.db.insert("customers", {
         userId: args.userId,
@@ -373,20 +394,38 @@ export const backfillMissingCustomers = internalMutation({
             );
             break;
           }
+          // by_dodoCustomerId match for the SAME user already covers
+          // the by_userId case for the dominant path. Count as repaired.
           repairedThisUser = true;
           break;
         }
-        await ctx.db.insert("customers", {
-          userId,
-          dodoCustomerId,
-          email,
-          normalizedEmail,
-          createdAt: now,
-          updatedAt: now,
-        });
-        console.warn(
-          `[billing/backfill] Inserted customers row for userId=${userId} from subscription dodoSubscriptionId=${sub.dodoSubscriptionId}.`,
-        );
+        // by_userId precedence: when `existing` row lacks `dodoCustomerId`
+        // (valid schema state since the field is `v.optional`), PATCH that
+        // row rather than inserting a second customers doc for the same
+        // user. `getCustomerByUserId` uses `.first()` defensively, so a
+        // duplicate would be a silent orphan. Greptile P1 review.
+        if (existing) {
+          console.warn(
+            `[billing/backfill] Patching dodoCustomerId=${dodoCustomerId} into existing customers row for userId=${userId} (dodoSubscriptionId=${sub.dodoSubscriptionId}).`,
+          );
+          await ctx.db.patch(existing._id, {
+            dodoCustomerId,
+            ...(email ? { email, normalizedEmail } : {}),
+            updatedAt: now,
+          });
+        } else {
+          await ctx.db.insert("customers", {
+            userId,
+            dodoCustomerId,
+            email,
+            normalizedEmail,
+            createdAt: now,
+            updatedAt: now,
+          });
+          console.warn(
+            `[billing/backfill] Inserted customers row for userId=${userId} from subscription dodoSubscriptionId=${sub.dodoSubscriptionId}.`,
+          );
+        }
         repairedThisUser = true;
         break;
       }
