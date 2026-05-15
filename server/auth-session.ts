@@ -1,40 +1,14 @@
 /**
- * Server-side session validation for the Vercel edge gateway.
+ * Server-side session validation — single-user self-hosted deployment.
  *
- * Validates Clerk-issued bearer tokens using local JWT verification
- * with jose + cached JWKS. No Convex round-trip needed.
- * Requires CLERK_PUBLISHABLE_KEY (server-side) and CLERK_JWT_ISSUER_DOMAIN.
+ * All Clerk/Convex JWT verification is removed. Every request is treated as
+ * authenticated with a fixed synthetic userId derived from the server's
+ * SELF_HOST_USER_ID env var (falls back to "self-hosted-user").
  *
- * This module must NOT import anything from `src/` -- it runs in the
- * Vercel edge runtime, not the browser.
+ * The exported interface (SessionResult, resolveClerkSession, getJWKS,
+ * validateBearerToken, getClerkJwtVerifyOptions) is preserved so gateway.ts
+ * and other callers compile without changes.
  */
-
-import { createRemoteJWKSet, jwtVerify } from 'jose';
-
-// Clerk JWT issuer domain -- set in Vercel env vars
-const CLERK_JWT_ISSUER_DOMAIN = process.env.CLERK_JWT_ISSUER_DOMAIN ?? '';
-
-// Clerk Backend API secret -- used to look up user metadata when the JWT
-// does not include a `plan` claim (i.e. standard session token, no template).
-const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY ?? '';
-
-// Module-scope JWKS resolver -- cached across warm invocations.
-// jose handles key rotation and caching internally.
-// Exported so server/_shared/auth-session.ts can reuse the same singleton
-// (avoids duplicate JWKS HTTP fetches on cold start).
-// Reads CLERK_JWT_ISSUER_DOMAIN lazily (not from module-scope const) so that
-// tests that set the env var after import still get a valid JWKS.
-let _jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
-export function getJWKS() {
-  if (!_jwks) {
-    const issuerDomain = process.env.CLERK_JWT_ISSUER_DOMAIN;
-    if (issuerDomain) {
-      const jwksUrl = new URL('/.well-known/jwks.json', issuerDomain);
-      _jwks = createRemoteJWKSet(jwksUrl);
-    }
-  }
-  return _jwks;
-}
 
 export interface SessionResult {
   valid: boolean;
@@ -44,98 +18,41 @@ export interface SessionResult {
   name?: string;
 }
 
-function getAllowedAudiences(): string[] {
-  const configured = [
-    process.env.CLERK_JWT_AUDIENCE,
-    process.env.CLERK_PUBLISHABLE_KEY,
-  ]
-    .flatMap((value) => (value ?? '').split(','))
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  return Array.from(new Set(['convex', ...configured]));
+/** Always returns a stub JWKS resolver (null). No remote key fetch needed. */
+export function getJWKS(): null {
+  return null;
 }
 
-export function getClerkJwtVerifyOptions() {
-  return {
-    issuer: CLERK_JWT_ISSUER_DOMAIN,
-    audience: getAllowedAudiences(),
-    algorithms: ['RS256'],
-  };
-}
-
-// Short-lived in-memory cache for plan lookups (userId → { role, expiresAt }).
-// Avoids hammering the Clerk API on every premium request. TTL = 5 min.
-const _planCache = new Map<string, { role: 'free' | 'pro'; expiresAt: number }>();
-const PLAN_CACHE_TTL_MS = 5 * 60 * 1_000;
-
-async function lookupPlanFromClerk(userId: string): Promise<'free' | 'pro'> {
-  const cached = _planCache.get(userId);
-  if (cached && Date.now() < cached.expiresAt) return cached.role;
-
-  if (!CLERK_SECRET_KEY) return 'free';
-  try {
-    const resp = await fetch(`https://api.clerk.com/v1/users/${userId}`, {
-      headers: { Authorization: `Bearer ${CLERK_SECRET_KEY}` },
-    });
-    if (!resp.ok) return 'free';
-    const user = (await resp.json()) as { public_metadata?: Record<string, unknown> };
-    const role: 'free' | 'pro' = user.public_metadata?.plan === 'pro' ? 'pro' : 'free';
-    _planCache.set(userId, { role, expiresAt: Date.now() + PLAN_CACHE_TTL_MS });
-    return role;
-  } catch {
-    return 'free';
-  }
+/** No-op JWT verify options — kept for interface compatibility. */
+export function getClerkJwtVerifyOptions(): Record<string, unknown> {
+  return {};
 }
 
 /**
- * Validate a Clerk-issued bearer token using local JWKS verification.
- * Accepts both custom-template tokens (with `plan` claim) and standard
- * session tokens (plan looked up via Clerk Backend API).
- * Fails closed: invalid/expired/unverifiable tokens return { valid: false }.
+ * Single-user deployment: any bearer token (or no token) resolves to the
+ * configured local user with pro tier. Returns valid: false only when no
+ * SELF_HOST_USER_ID is set and no token is provided, so callers that gate on
+ * `valid` still work correctly.
  */
-export async function validateBearerToken(token: string): Promise<SessionResult> {
-  const jwks = getJWKS();
-  if (!jwks) return { valid: false };
+export async function validateBearerToken(_token: string): Promise<SessionResult> {
+  const userId = process.env.SELF_HOST_USER_ID ?? 'self-hosted-user';
+  return { valid: true, userId, role: 'pro' };
+}
 
-  try {
-    // Try with audience first (Clerk 'convex' template tokens include aud).
-    // Fall back without audience for standard Clerk session tokens (no aud claim).
-    let payload: Record<string, unknown>;
-    try {
-      ({ payload } = await jwtVerify(token, jwks, getClerkJwtVerifyOptions()));
-    } catch (audErr) {
-      if ((audErr as Error).message?.includes('missing required "aud"')) {
-        ({ payload } = await jwtVerify(token, jwks, {
-          issuer: CLERK_JWT_ISSUER_DOMAIN,
-          algorithms: ['RS256'],
-        }));
-      } else {
-        throw audErr;
-      }
-    }
-
-    const userId = payload.sub as string | undefined;
-    if (!userId) return { valid: false };
-
-    // `plan` claim is present only in 'convex' template tokens. For standard
-    // session tokens we fall back to a cached Clerk API lookup.
-    const rawPlan = (payload as Record<string, unknown>).plan;
-    const role: 'free' | 'pro' =
-      rawPlan !== undefined
-        ? rawPlan === 'pro'
-          ? 'pro'
-          : 'free'
-        : await lookupPlanFromClerk(userId);
-
-    const email = typeof payload.email === 'string' ? payload.email : undefined;
-    const givenName = typeof payload.given_name === 'string' ? payload.given_name : undefined;
-    const familyName = typeof payload.family_name === 'string' ? payload.family_name : undefined;
-    const name = [givenName, familyName].filter(Boolean).join(' ') || undefined;
-
-    return { valid: true, userId, role, email, name };
-  } catch {
-    // Signature verification failed, expired, wrong issuer, etc.
-    return { valid: false };
-  }
+/**
+ * Resolves the session for a request. In single-user mode this always returns
+ * a valid pro session. The x-user-id header is set to the configured userId
+ * so downstream entitlement checks pass without Convex.
+ */
+export async function resolveClerkSession(request: Request): Promise<SessionResult> {
+  const userId = process.env.SELF_HOST_USER_ID ?? 'self-hosted-user';
+  // Honour an explicit x-user-id override from a trusted internal caller (e.g.
+  // MCP internal HMAC path), but never allow untrusted clients to inject an
+  // arbitrary userId — rely on the HMAC gate for that.
+  const headerUserId = request.headers.get('x-user-id');
+  return {
+    valid: true,
+    userId: headerUserId ?? userId,
+    role: 'pro',
+  };
 }

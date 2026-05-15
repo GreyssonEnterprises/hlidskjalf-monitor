@@ -499,7 +499,7 @@ test('returns local handler error when fetch(Request) uses a consumed body', asy
   }
 });
 
-test('strips browser origin headers when proxying to cloud fallback (cloudFallback enabled)', async () => {
+test.skip('strips browser origin headers when proxying to cloud fallback (cloudFallback enabled) — SKIPPED post-cloud-strip: cloudFallback removed', async () => {
   const remote = await setupRemoteServer();
   const localApi = await setupApiDir({});
 

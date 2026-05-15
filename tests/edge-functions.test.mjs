@@ -16,10 +16,13 @@ const edgeFunctions = readdirSync(apiDir)
   .filter((f) => f.endsWith('.js') && !f.startsWith('_'))
   .map((f) => ({ name: f, path: join(apiDir, f) }));
 
-// Also include api/oauth/ subdir edge functions
-const oauthEdgeFunctions = readdirSync(apiOauthDir)
-  .filter((f) => f.endsWith('.js') && !f.startsWith('_'))
-  .map((f) => ({ name: `oauth/${f}`, path: join(apiOauthDir, f) }));
+// Also include api/oauth/ subdir edge functions — directory removed in the
+// cloud-strip refactor; tolerate absence so the rest of the suite still runs.
+const oauthEdgeFunctions = existsSync(apiOauthDir)
+  ? readdirSync(apiOauthDir)
+      .filter((f) => f.endsWith('.js') && !f.startsWith('_'))
+      .map((f) => ({ name: `oauth/${f}`, path: join(apiOauthDir, f) }))
+  : [];
 
 const allEdgeFunctions = [...edgeFunctions, ...oauthEdgeFunctions];
 
@@ -124,7 +127,7 @@ describe('reverse-geocode Redis write', () => {
   });
 });
 
-describe('oauth/authorize.js consent page safety', () => {
+describe.skip('oauth/authorize.js consent page safety — SKIPPED post-cloud-strip (api/oauth/authorize.js deleted with the rest of the Pro OAuth surface)', () => {
   const authorizePath = join(apiOauthDir, 'authorize.js');
 
   it('uses _js POST body field (not X-Requested-With header) for XHR detection — avoids CORS preflight', () => {

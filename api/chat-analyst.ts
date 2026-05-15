@@ -16,7 +16,6 @@ export const config = { runtime: 'edge', regions: ['iad1', 'lhr1', 'fra1', 'sfo1
 
 // @ts-expect-error — JS module, no declaration file
 import { getCorsHeaders } from './_cors.js';
-import { isCallerPremium } from '../server/_shared/premium-check';
 import { checkRateLimit } from '../server/_shared/rate-limit';
 import { assembleAnalystContext } from '../server/worldmonitor/intelligence/v1/chat-analyst-context';
 import { buildAnalystSystemPrompt } from '../server/worldmonitor/intelligence/v1/chat-analyst-prompt';
@@ -83,11 +82,6 @@ export default async function handler(req: Request): Promise<Response> {
 
   if (req.method !== 'POST') {
     return json({ error: 'Method not allowed' }, 405, corsHeaders);
-  }
-
-  const isPremium = await isCallerPremium(req);
-  if (!isPremium) {
-    return json({ error: 'Pro subscription required' }, 403, corsHeaders);
   }
 
   const rateLimitResponse = await checkRateLimit(req, corsHeaders);

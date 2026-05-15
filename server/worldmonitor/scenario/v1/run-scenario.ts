@@ -5,7 +5,6 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/scenario/v1/service_server';
 import { ApiError, ValidationError } from '../../../../src/generated/server/worldmonitor/scenario/v1/service_server';
 
-import { isCallerPremium } from '../../../_shared/premium-check';
 import { runRedisPipeline } from '../../../_shared/redis';
 import { getScenarioTemplate } from '../../supply-chain/v1/scenario-templates';
 
@@ -23,14 +22,9 @@ function generateJobId(): string {
 }
 
 export async function runScenario(
-  ctx: ServerContext,
+  _ctx: ServerContext,
   req: RunScenarioRequest,
 ): Promise<RunScenarioResponse> {
-  const isPro = await isCallerPremium(ctx.request);
-  if (!isPro) {
-    throw new ApiError(403, 'PRO subscription required', '');
-  }
-
   const scenarioId = (req.scenarioId ?? '').trim();
   if (!scenarioId) {
     throw new ValidationError([{ field: 'scenarioId', description: 'scenarioId is required' }]);

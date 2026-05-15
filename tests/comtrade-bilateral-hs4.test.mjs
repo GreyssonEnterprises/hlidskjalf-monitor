@@ -25,7 +25,7 @@ describe('getCountryProducts sebuf handler (server/worldmonitor/supply-chain/v1/
     );
   });
 
-  it('uses isCallerPremium for PRO gating against ctx.request', () => {
+  it.skip('uses isCallerPremium for PRO gating against ctx.request — SKIPPED post-cloud-strip (premium-check.ts deleted; single-user self-host always-allow)', () => {
     assert.ok(
       src.includes('isCallerPremium'),
       'must use isCallerPremium for PRO-gating',
@@ -36,7 +36,7 @@ describe('getCountryProducts sebuf handler (server/worldmonitor/supply-chain/v1/
     );
   });
 
-  it('returns the typed empty payload for both non-PRO and invalid-iso2 paths', () => {
+  it.skip('returns the typed empty payload for both non-PRO and invalid-iso2 paths — SKIPPED post-cloud-strip (non-PRO branch removed)', () => {
     assert.ok(
       /products: \[\], fetchedAt: ''/.test(src),
       'empty fallback must have empty products array and empty fetchedAt',
