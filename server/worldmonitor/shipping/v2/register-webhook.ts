@@ -10,7 +10,6 @@ import {
 
 // @ts-expect-error — JS module, no declaration file
 import { validateApiKey } from '../../../../api/_api-key.js';
-import { isCallerPremium } from '../../../_shared/premium-check';
 import { runRedisPipeline } from '../../../_shared/redis';
 import {
   WEBHOOK_TTL,
@@ -41,11 +40,6 @@ export async function registerWebhook(
   };
   if (apiKeyResult.required && !apiKeyResult.valid) {
     throw new ApiError(401, apiKeyResult.error ?? 'API key required', '');
-  }
-
-  const isPro = await isCallerPremium(ctx.request);
-  if (!isPro) {
-    throw new ApiError(403, 'PRO subscription required', '');
   }
 
   const callbackUrl = (req.callbackUrl ?? '').trim();

@@ -1,12 +1,15 @@
 /**
- * Validates user-owned API keys by hashing the provided key and looking up
- * the hash in Convex via the internal HTTP action.
+ * User API key validation — single-user self-hosted deployment.
  *
- * Uses cachedFetchJson for Redis caching with in-flight coalescing and
- * environment-partitioned keys (no raw=true — keys are prefixed by deploy).
+ * Convex backend calls are removed. API keys are validated against the
+ * SELF_HOST_API_KEY env var (if set). If not set, all wm_ keys are accepted
+ * and mapped to the self-hosted userId.
+ *
+ * The exported interface (validateUserApiKey, invalidateApiKeyCache) is
+ * preserved so gateway.ts and other callers compile without changes.
  */
 
-import { cachedFetchJson, deleteRedisKey } from './redis';
+import { deleteRedisKey } from './redis';
 
 interface UserKeyResult {
   userId: string;
@@ -14,8 +17,6 @@ interface UserKeyResult {
   name: string;
 }
 
-const CACHE_TTL_SECONDS = 60; // 1 min — short to limit staleness on revocation
-const NEG_TTL_SECONDS = 60;   // negative cache: avoid hammering Convex with invalid keys
 const CACHE_KEY_PREFIX = 'user-api-key:';
 
 /** SHA-256 hex digest (Web Crypto API — works in Edge Runtime). */
@@ -27,56 +28,32 @@ async function sha256Hex(input: string): Promise<string> {
 /**
  * Validate a user-owned API key.
  *
- * Returns the userId and key metadata if valid, or null if invalid/revoked.
- * Uses cachedFetchJson for Redis caching with request coalescing and
- * standard NEG_SENTINEL for negative results.
+ * Self-hosted mode: if SELF_HOST_API_KEY is set, only that key is accepted.
+ * If not set, any key starting with "wm_" is accepted (open self-hosted).
+ * Returns the self-hosted userId and a synthetic keyId on success.
  */
 export async function validateUserApiKey(key: string): Promise<UserKeyResult | null> {
   if (!key || !key.startsWith('wm_')) return null;
 
-  const keyHash = await sha256Hex(key);
-  const cacheKey = `${CACHE_KEY_PREFIX}${keyHash}`;
-
-  try {
-    return await cachedFetchJson<UserKeyResult>(
-      cacheKey,
-      CACHE_TTL_SECONDS,
-      () => fetchFromConvex(keyHash),
-      NEG_TTL_SECONDS,
-    );
-  } catch (err) {
-    // Fail-soft: transient Convex/network errors degrade to unauthorized
-    // rather than bubbling a 500 through the gateway or isCallerPremium.
-    console.warn('[user-api-key] validateUserApiKey failed:', err instanceof Error ? err.message : String(err));
+  const configuredKey = process.env.SELF_HOST_API_KEY;
+  if (configuredKey && key !== configuredKey) {
     return null;
   }
-}
 
-/** Fetch key validation from Convex internal endpoint. */
-async function fetchFromConvex(keyHash: string): Promise<UserKeyResult | null> {
-  const convexSiteUrl = process.env.CONVEX_SITE_URL;
-  const convexSharedSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
-  if (!convexSiteUrl || !convexSharedSecret) return null;
+  const userId = process.env.SELF_HOST_USER_ID ?? 'self-hosted-user';
+  const keyHash = await sha256Hex(key);
 
-  const resp = await fetch(`${convexSiteUrl}/api/internal-validate-api-key`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'worldmonitor-gateway/1.0',
-      'x-convex-shared-secret': convexSharedSecret,
-    },
-    body: JSON.stringify({ keyHash }),
-    signal: AbortSignal.timeout(3_000),
-  });
-
-  if (!resp.ok) return null;
-  return resp.json() as Promise<UserKeyResult | null>;
+  return {
+    userId,
+    keyId: keyHash.slice(0, 16),
+    name: 'self-hosted',
+  };
 }
 
 /**
  * Delete the Redis cache entry for a specific API key hash.
- * Called after revocation to ensure the key cannot be used during the TTL window.
- * Uses prefixed keys (no raw=true) matching the cache writes above.
+ * No-op in self-hosted mode (no positive cache is written), but kept for
+ * interface compatibility with callers that call this on key revocation.
  */
 export async function invalidateApiKeyCache(keyHash: string): Promise<void> {
   await deleteRedisKey(`${CACHE_KEY_PREFIX}${keyHash}`);

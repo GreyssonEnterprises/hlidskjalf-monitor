@@ -18,14 +18,6 @@ import { checkRateLimit, checkEndpointRateLimit, hasEndpointRatePolicy } from '.
 import { drainResponseHeaders } from './_shared/response-headers';
 import { checkEntitlement, getRequiredTier, getEntitlements } from './_shared/entitlement-check';
 import { resolveClerkSession } from './_shared/auth-session';
-import {
-  INTERNAL_MCP_SIG_HEADER,
-  INTERNAL_MCP_USER_ID_HEADER,
-  INTERNAL_MCP_VERIFIED_HEADER,
-  TRUSTED_USER_ID_HEADER,
-  getInternalMcpVerifiedNonce,
-  verifyInternalMcpRequest,
-} from './_shared/mcp-internal-hmac';
 import { buildUsageIdentity, type UsageIdentityInput } from './_shared/usage-identity';
 import {
   deliverUsageEvents,
@@ -52,22 +44,6 @@ import {
 import type { ServerOptions } from '../src/generated/server/worldmonitor/seismology/v1/service_server';
 
 export const serverOptions: ServerOptions = { onError: mapErrorToResponse };
-
-/**
- * Internal-MCP request body size cap (256 KB). Internal-MCP fetches
- * carry small JSON-RPC params; this ceiling prevents the gateway from
- * buffering arbitrarily large bodies on the strip / HMAC-verify paths.
- *
- * Applied at:
- *   - The trust-marker strip block (any Pro-marked inbound request)
- *   - The HMAC-verify block (signed internal-MCP requests)
- *
- * Both Content-Length AND post-buffer byte count are checked because
- * Content-Length can be absent / wrong for chunked or streamed bodies.
- *
- * F8 (U7+U8 review pass).
- */
-const MAX_INTERNAL_MCP_BODY = 256 * 1024;
 
 // --- Edge cache tier definitions ---
 // NOTE: This map is shared across all domain bundles (~3KB). Kept centralised for
@@ -436,247 +412,9 @@ export function createDomainGateway(
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // ----------------------------------------------------------------------
-    // Defense-in-depth: strip client-controlled copies of the trusted
-    // internal-MCP markers BEFORE any other logic runs. The gateway is the
-    // ONLY layer permitted to set `x-wm-mcp-internal-verified` /
-    // `x-user-id` (the latter is also set by the Clerk-session block
-    // below from a verified bearer). Without the strip step, an attacker
-    // who sends `x-wm-mcp-internal-verified: 1` from outside could spoof
-    // premium context to any handler that reads these markers via
-    // `isCallerPremium`. The strip MUST run regardless of whether the
-    // X-WM-MCP-Internal header is present, so that the legacy
-    // `validateApiKey` path also receives a sanitised request.
-    //
-    // Mutation invariant: every subsequent request reconstruction in this
-    // function must build from the (already-stripped) `request`, not from
-    // `originalRequest`.
-    // ----------------------------------------------------------------------
-    {
-      const inboundHeaders = request.headers;
-      if (
-        inboundHeaders.has(INTERNAL_MCP_VERIFIED_HEADER) ||
-        inboundHeaders.has(TRUSTED_USER_ID_HEADER)
-      ) {
-        const stripped = new Headers(inboundHeaders);
-        stripped.delete(INTERNAL_MCP_VERIFIED_HEADER);
-        stripped.delete(TRUSTED_USER_ID_HEADER);
-        // For GET/HEAD: no body to forward. For other methods: buffer the
-        // body bytes and pass them to the new Request — `body: request.body`
-        // (a ReadableStream) requires `duplex: 'half'` in Node's undici
-        // Request constructor, and the cleaner cross-runtime approach is
-        // to forward bytes. Internal-MCP payloads are small JSON RPC params.
-        //
-        // F8: cap the buffered body at MAX_INTERNAL_MCP_BODY (256 KB).
-        // Internal-MCP and gateway-bypass-strip paths only carry small
-        // JSON-RPC params; 256 KB is a safe ceiling that prevents an
-        // attacker from forcing the gateway to allocate megabytes of
-        // memory just by setting Content-Length on a forged request.
-        const reInit: RequestInit = { method: request.method, headers: stripped };
-        if (request.method !== 'GET' && request.method !== 'HEAD') {
-          const contentLen = parseInt(request.headers.get('Content-Length') ?? '0', 10);
-          if (Number.isFinite(contentLen) && contentLen > MAX_INTERNAL_MCP_BODY) {
-            // F14: distinct reason label for body-size rejections so
-            // telemetry separates this class from auth-401s.
-            emitRequest(413, 'malformed_request', null);
-            return new Response(JSON.stringify({ error: 'payload_too_large' }), {
-              status: 413,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
-            });
-          }
-          try {
-            const bytes = await request.clone().arrayBuffer();
-            // Defense-in-depth: also reject if the actual buffered byte
-            // count exceeds the cap (Content-Length can be absent or
-            // wrong on chunked / streamed bodies).
-            if (bytes.byteLength > MAX_INTERNAL_MCP_BODY) {
-              emitRequest(413, 'malformed_request', null);
-              return new Response(JSON.stringify({ error: 'payload_too_large' }), {
-                status: 413,
-                headers: { 'Content-Type': 'application/json', ...corsHeaders },
-              });
-            }
-            reInit.body = bytes;
-          } catch {
-            // If we can't buffer the body, we can't safely forward the
-            // request without trust-markers stripped. 400 the caller.
-            // F14: use a distinct telemetry reason — "auth_401" was
-            // misleading (this is a body-buffer failure, not an auth
-            // outcome).
-            emitRequest(400, 'malformed_request', null);
-            return new Response(JSON.stringify({ error: 'malformed_request' }), {
-              status: 400,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
-            });
-          }
-        }
-        request = new Request(request.url, reInit);
-      }
-    }
-
-    // ----------------------------------------------------------------------
-    // Internal-MCP HMAC pre-check — runs BEFORE `validateApiKey` so that a
-    // verified Pro tool fetch never needs an `X-WorldMonitor-Key`. If
-    // `X-WM-MCP-Internal` is present, treat as a deliberate signed request:
-    //   - verify ⇒ entitlement re-check ⇒ rebuild Request with trusted markers
-    //   - verify FAILS ⇒ 401 immediately (do NOT fall through; present-but-
-    //     invalid is a forge attempt, falling through to validateApiKey
-    //     would let an attacker chain the legacy auth path).
-    // If the header is absent, fall through to the existing validateApiKey
-    // path with the (header-stripped) request — Starter+ wm_ keys remain
-    // unchanged.
-    //
-    // When this flag is true, downstream auth gates (validateApiKey, the
-    // PREMIUM_RPC_PATHS bearer gate, IP rate limiting) are skipped. The MCP
-    // edge already enforced 50/day + 60/min/userId; the gateway-level
-    // entitlement check for ENDPOINT_ENTITLEMENTS is also skipped here
-    // because we re-checked tier ≥ 1 + mcpAccess === true above.
-    // ----------------------------------------------------------------------
-    let internalMcpVerified = false;
-    if (request.headers.has(INTERNAL_MCP_SIG_HEADER)) {
-      const hmacSecret = process.env.MCP_INTERNAL_HMAC_SECRET ?? '';
-      if (!hmacSecret) {
-        // Server misconfiguration on the HMAC-attempt path. Surface as 500
-        // CONFIGURATION so operators see it; legacy wm_ key path is
-        // unaffected because we only enter this branch when the caller
-        // explicitly tried to use the internal-MCP route.
-        emitRequest(500, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'CONFIGURATION', detail: 'MCP_INTERNAL_HMAC_SECRET not configured' }),
-          { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
-      }
-      // Read the body bytes ONCE upfront. We need them in three places:
-      //   1. Inside verifyInternalMcpRequest for the bodyHash compare
-      //   2. To rebuild a fresh Request with trusted markers (Node's undici
-      //      Request constructor refuses a ReadableStream body without
-      //      `duplex: 'half'`; passing bytes sidesteps that)
-      //   3. To make the body re-readable by the downstream handler — once
-      //      a stream is locked, subsequent reads throw.
-      // Reading then passing buffered bytes is safe for internal-MCP
-      // payloads (small JSON RPC params); not appropriate for streamed
-      // uploads, which this path doesn't carry.
-      let bodyBytes: ArrayBuffer | null = null;
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        // F8: cap inbound body BEFORE buffering. Internal-MCP signed
-        // requests carry small JSON-RPC params; 256 KB is a safe ceiling.
-        const contentLen = parseInt(request.headers.get('Content-Length') ?? '0', 10);
-        if (Number.isFinite(contentLen) && contentLen > MAX_INTERNAL_MCP_BODY) {
-          emitRequest(413, 'malformed_request', null);
-          return new Response(JSON.stringify({ error: 'payload_too_large' }), {
-            status: 413,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
-        }
-        try {
-          bodyBytes = await request.clone().arrayBuffer();
-        } catch {
-          emitRequest(401, 'auth_401', null);
-          return new Response(
-            JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-            { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-          );
-        }
-        if (bodyBytes.byteLength > MAX_INTERNAL_MCP_BODY) {
-          emitRequest(413, 'malformed_request', null);
-          return new Response(JSON.stringify({ error: 'payload_too_large' }), {
-            status: 413,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
-        }
-        // Reconstruct request from buffered bytes so verify can clone freely
-        // and the downstream handler can read the body normally.
-        request = new Request(request.url, {
-          method: request.method,
-          headers: request.headers,
-          body: bodyBytes,
-        });
-      }
-      // verifyInternalMcpRequest returns null when X-WM-MCP-User-Id is
-      // missing, signature header is malformed, timestamp is out of
-      // window, or the HMAC compare fails. All collapse to a single 401 —
-      // intentionally do NOT distinguish (don't leak which piece failed
-      // to a forge probe).
-      const verified = await verifyInternalMcpRequest(request, hmacSecret);
-      if (!verified) {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'invalid_internal_mcp_signature' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
-      }
-      // Entitlement re-check at the gateway: the MCP edge already verifies
-      // tier ≥ 1 + mcpAccess + validUntil before signing the outbound
-      // fetch (api/mcp.ts). This second check defends against (a) the
-      // edge being bypassed (e.g. captured signature + leaked secret), (b)
-      // mid-request entitlement lapse, (c) future regressions where a
-      // non-edge caller signs requests.
-      //
-      // F1 (U7+U8 review pass): include `validUntil < Date.now()` in the
-      // rejection condition. The cache-hot path in `entitlement-check.ts`
-      // self-validates `validUntil >= Date.now()` at line 134, but the
-      // Convex fallback at lines 154-156 does not — without this check
-      // an entitlement row with stale `validUntil` would pass the gateway
-      // re-check via the fallback path. Mirror the per-handler runProPreChecks
-      // and authorize-pro entitlement guards.
-      const ent = await getEntitlements(verified.userId);
-      if (
-        !ent ||
-        ent.features.tier < 1 ||
-        // mcpAccess flag lands in U10 — undefined means "field not present
-        // on this entitlement row", which we treat as false. This keeps
-        // pre-U10 entitlement rows from accidentally granting MCP access.
-        (ent.features as { mcpAccess?: boolean }).mcpAccess !== true ||
-        ent.validUntil < Date.now()
-      ) {
-        emitRequest(401, 'auth_401', null);
-        return new Response(
-          JSON.stringify({ error: 'insufficient_entitlement' }),
-          { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } },
-        );
-      }
-      // Rebuild Request with trusted markers — sanitised header set
-      // already had inbound copies stripped above, so this is the ONLY
-      // place those markers can enter the downstream path. Body is
-      // re-supplied from the bytes we buffered (bodyBytes is null for
-      // GET/HEAD, in which case we omit the body field entirely).
-      //
-      // The verified-marker value is a per-process-startup random nonce,
-      // NOT the constant '1'. This protects direct edge functions that
-      // call `isCallerPremium` but don't route through this gateway —
-      // an attacker can't guess the nonce, so spoofing the marker on
-      // those endpoints fails closed.
-      //
-      // F7 (U7+U8 review pass): strip the inbound HMAC headers BEFORE
-      // setting the trusted markers. The gateway has consumed them via
-      // verifyInternalMcpRequest; downstream handlers should only see
-      // the trusted-marker pair, not the raw signature/userId headers.
-      // Defense-in-depth — handlers shouldn't have any reason to read
-      // the inbound HMAC.
-      const trusted = new Headers(request.headers);
-      trusted.delete(INTERNAL_MCP_SIG_HEADER);
-      trusted.delete(INTERNAL_MCP_USER_ID_HEADER);
-      trusted.set(INTERNAL_MCP_VERIFIED_HEADER, getInternalMcpVerifiedNonce());
-      trusted.set(TRUSTED_USER_ID_HEADER, verified.userId);
-      const rebuildInit: RequestInit = { method: request.method, headers: trusted };
-      if (bodyBytes !== null) rebuildInit.body = bodyBytes;
-      request = new Request(request.url, rebuildInit);
-      usage.sessionUserId = verified.userId;
-      if (typeof ent.features.tier === 'number') {
-        usage.tier = ent.features.tier;
-      }
-      internalMcpVerified = true;
-    }
-
     // Tier gate check first — JWT resolution is expensive (JWKS + RS256) and only needed
     // for tier-gated endpoints. Non-tier-gated endpoints never use sessionUserId.
-    //
-    // Internal-MCP verified path skips the tier gate / Clerk JWT resolution
-    // entirely: we already resolved the userId via HMAC verify and confirmed
-    // tier ≥ 1 + mcpAccess === true. Re-running the JWT path on a request
-    // that has no Authorization header would just no-op anyway.
-    const isTierGated = !internalMcpVerified && getRequiredTier(pathname) !== null;
-    const needsLegacyProBearerGate = !internalMcpVerified && PREMIUM_RPC_PATHS.has(pathname) && !isTierGated;
+    const isTierGated = getRequiredTier(pathname) !== null;
 
     // Session resolution — extract userId from bearer token (Clerk JWT) if present.
     // Only runs for tier-gated endpoints to avoid JWKS lookup on every request.
@@ -701,18 +439,10 @@ export function createDomainGateway(
 
     // API key validation — tier-gated endpoints require EITHER an API key OR a valid bearer token.
     // Authenticated users (sessionUserId present) bypass the API key requirement.
-    //
-    // Internal-MCP verified path: skip validateApiKey entirely. The HMAC
-    // verify replaced the API key contract for this request — running
-    // validateApiKey would 401 every Pro tool fetch (no wm_ key on the
-    // request). Telemetry stays attributed via the verified userId set
-    // above; entitlement re-check (`features.tier ≥ 1 && mcpAccess`) was
-    // already performed before flipping `internalMcpVerified = true`.
-    let keyCheck: { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' } = internalMcpVerified
-      ? { valid: true, required: false }
-      : ((await validateApiKey(request, {
-          forceKey: (isTierGated && !sessionUserId) || needsLegacyProBearerGate,
-        })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' });
+    let keyCheck: { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' } =
+      (await validateApiKey(request, {
+        forceKey: isTierGated && !sessionUserId,
+      })) as { valid: boolean; required: boolean; error?: string; kind?: 'enterprise' | 'session' | 'user' };
 
     // Clerk session is itself proof of authentication (validated at line 410).
     // validateApiKey is strict-no-trust-of-headers per #3541 and would 401 every
@@ -763,84 +493,12 @@ export function createDomainGateway(
       usage.enterpriseApiKey = wmKey;
     }
 
-    // User API keys on PREMIUM_RPC_PATHS need verified pro-tier entitlement.
-    // Admin keys (WORLDMONITOR_VALID_KEYS) bypass this since they are operator-issued.
-    if (isUserApiKey && needsLegacyProBearerGate && sessionUserId) {
-      const ent = await getEntitlements(sessionUserId);
-      if (ent) usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
-      if (!ent || !ent.features.apiAccess) {
-        emitRequest(403, 'tier_403', null);
-        return new Response(JSON.stringify({ error: 'API access subscription required' }), {
-          status: 403,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
-      }
-    }
-
     if (keyCheck.required && !keyCheck.valid) {
-      if (needsLegacyProBearerGate) {
-        const authHeader = request.headers.get('Authorization');
-        if (authHeader?.startsWith('Bearer ')) {
-          const { validateBearerToken } = await import('./auth-session');
-          const session = await validateBearerToken(authHeader.slice(7));
-          if (!session.valid) {
-            emitRequest(401, 'auth_401', null);
-            return new Response(JSON.stringify({ error: 'Invalid or expired session' }), {
-              status: 401,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
-            });
-          }
-          // Capture identity for telemetry — legacy bearer auth bypasses the
-          // earlier resolveClerkSession() block (only runs for tier-gated routes),
-          // so without this premium bearer requests would emit as anonymous.
-          if (session.userId) {
-            sessionUserId = session.userId;
-            usage.sessionUserId = session.userId;
-          }
-          // Accept EITHER a Clerk 'pro' role OR a Convex Dodo entitlement with
-          // tier >= 1. The Dodo webhook pipeline writes Convex entitlements but
-          // does NOT sync Clerk publicMetadata.role, so a paying subscriber's
-          // session.role stays 'free' indefinitely. A Clerk-role-only check
-          // would block every paying user on legacy premium endpoints despite
-          // a valid Dodo subscription. This mirrors the two-signal logic in
-          // server/_shared/premium-check.ts::isCallerPremium so the gateway
-          // gate and the per-handler gate agree on who is premium — same split
-          // already documented at the frontend layer (panel-gating.ts:11-27).
-          //
-          // Note: validateBearerToken returns session.userId directly, so we
-          // use it without needing to resolveSessionUserId() — sessionUserId
-          // is intentionally only resolved for ENDPOINT_ENTITLEMENTS-tier-gated
-          // endpoints earlier (line 292) to avoid a JWKS lookup on every
-          // legacy premium request. validateBearerToken already does its own
-          // verification here (line 360) and exposes userId on the result.
-          let allowed = session.role === 'pro';
-          if (!allowed && session.userId) {
-            const ent = await getEntitlements(session.userId);
-            if (ent) usage.tier = typeof ent.features.tier === 'number' ? ent.features.tier : 0;
-            allowed = !!ent && ent.features.tier >= 1 && ent.validUntil >= Date.now();
-          }
-          if (!allowed) {
-            emitRequest(403, 'tier_403', null);
-            return new Response(JSON.stringify({ error: 'Pro subscription required' }), {
-              status: 403,
-              headers: { 'Content-Type': 'application/json', ...corsHeaders },
-            });
-          }
-          // Valid pro session (Clerk role OR Dodo entitlement) — fall through to route handling.
-        } else {
-          emitRequest(401, 'auth_401', null);
-          return new Response(JSON.stringify({ error: keyCheck.error, _debug: (keyCheck as any)._debug }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
-        }
-      } else {
-        emitRequest(401, 'auth_401', null);
-        return new Response(JSON.stringify({ error: keyCheck.error }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
-      }
+      emitRequest(401, 'auth_401', null);
+      return new Response(JSON.stringify({ error: keyCheck.error }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
     }
 
     // Entitlement check — blocks tier-gated endpoints for users below required tier.
@@ -848,16 +506,8 @@ export function createDomainGateway(
     // User API keys do NOT bypass — the key owner's tier is checked normally.
     // Anonymous wms_ session tokens (kind: 'session') do NOT bypass — they are
     // freely mintable by any caller and are NOT user-bound (PR #3557 review).
-    //
-    // Internal-MCP verified path also bypasses: we already confirmed
-    // tier ≥ 1 + mcpAccess === true above, and `checkEntitlement` reads
-    // x-user-id from the request — which IS set on the trusted request,
-    // but ENDPOINT_ENTITLEMENTS treats `tier=2` (api) as required for
-    // some routes. Pro = tier 1; we don't want a tier-2-required route
-    // to 403 a Pro caller via the MCP path because Pro callers reach
-    // the gateway only through the MCP edge's whitelisted tool set.
     const isEnterpriseAuth = keyCheck.valid && wmKey && !isUserApiKey && keyCheck.kind === 'enterprise';
-    if (!isEnterpriseAuth && !internalMcpVerified) {
+    if (!isEnterpriseAuth) {
       const entitlementResponse = await checkEntitlement(request, pathname, corsHeaders);
       if (entitlementResponse) {
         const entReason: RequestReason =
@@ -877,24 +527,17 @@ export function createDomainGateway(
     }
 
     // IP-based rate limiting — two-phase: endpoint-specific first, then global fallback.
-    //
-    // Internal-MCP verified path skips IP rate limiting: the MCP edge
-    // already enforced 50/day + 60/min per userId in api/mcp.ts. A second
-    // limiter here would create misleading double-counting and could 429
-    // legitimate Pro tool fetches that pass the upstream cap.
-    if (!internalMcpVerified) {
-      const endpointRlResponse = await checkEndpointRateLimit(request, pathname, corsHeaders);
-      if (endpointRlResponse) {
-        emitRequest(endpointRlResponse.status, 'rate_limit_429', null);
-        return endpointRlResponse;
-      }
+    const endpointRlResponse = await checkEndpointRateLimit(request, pathname, corsHeaders);
+    if (endpointRlResponse) {
+      emitRequest(endpointRlResponse.status, 'rate_limit_429', null);
+      return endpointRlResponse;
+    }
 
-      if (!hasEndpointRatePolicy(pathname)) {
-        const rateLimitResponse = await checkRateLimit(request, corsHeaders);
-        if (rateLimitResponse) {
-          emitRequest(rateLimitResponse.status, 'rate_limit_429', null);
-          return rateLimitResponse;
-        }
+    if (!hasEndpointRatePolicy(pathname)) {
+      const rateLimitResponse = await checkRateLimit(request, corsHeaders);
+      if (rateLimitResponse) {
+        emitRequest(rateLimitResponse.status, 'rate_limit_429', null);
+        return rateLimitResponse;
       }
     }
 

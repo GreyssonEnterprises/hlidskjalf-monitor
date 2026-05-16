@@ -111,10 +111,6 @@ import { initPaymentFailureBanner } from '@/components/payment-failure-banner';
 import { handleCheckoutReturn } from '@/services/checkout-return';
 import { initCheckoutOverlay, destroyCheckoutOverlay, showCheckoutSuccess, consumePostCheckoutFlag, clearCheckoutAttempt } from '@/services/checkout';
 import { showCheckoutFailureBanner } from '@/components/checkout-failure-banner';
-import { McpDataPanel } from '@/components/McpDataPanel';
-import { openMcpConnectModal } from '@/components/McpConnectModal';
-import { loadMcpPanels, saveMcpPanel } from '@/services/mcp-store';
-import type { McpPanelSpec } from '@/services/mcp-store';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
 import type { AuthSession } from '@/services/auth-state';
 import { PanelGateReason, getPanelGateReason, hasPremiumAccess } from '@/services/panel-gating';
@@ -1417,14 +1413,6 @@ export class PanelLayoutManager implements AppModule {
       }
     }
 
-    for (const spec of loadMcpPanels()) {
-      const panel = new McpDataPanel(spec);
-      this.ctx.panels[spec.id] = panel;
-      if (!this.ctx.panelSettings[spec.id]) {
-        this.ctx.panelSettings[spec.id] = { name: spec.title, enabled: true, priority: 3 };
-      }
-    }
-
     const variantOrder = (VARIANT_DEFAULTS[SITE_VARIANT] ?? VARIANT_DEFAULTS['full'] ?? []).filter(k => k !== 'map');
     const activePanelSet = new Set(Object.keys(this.ctx.panelSettings));
     const crossVariantKeys = Object.keys(this.ctx.panelSettings).filter(k => !variantOrder.includes(k) && k !== 'map');
@@ -1548,28 +1536,6 @@ export class PanelLayoutManager implements AppModule {
     });
     panelsGrid.appendChild(proBlock);
 
-    const mcpBlock = document.createElement('button');
-    mcpBlock.className = 'add-panel-block mcp-panel-block';
-    mcpBlock.setAttribute('aria-label', t('mcp.connectPanel'));
-    const mcpIcon = document.createElement('span');
-    mcpIcon.className = 'add-panel-block-icon';
-    mcpIcon.textContent = '\u26a1';
-    const mcpLabel = document.createElement('span');
-    mcpLabel.className = 'add-panel-block-label';
-    mcpLabel.textContent = t('mcp.connectPanel');
-    const mcpBadge = document.createElement('span');
-    mcpBadge.className = 'widget-pro-badge';
-    mcpBadge.textContent = t('widgets.proBadge');
-    mcpBlock.appendChild(mcpIcon);
-    mcpBlock.appendChild(mcpLabel);
-    mcpBlock.appendChild(mcpBadge);
-    mcpBlock.addEventListener('click', () => {
-      openMcpConnectModal({
-        onComplete: (spec) => this.addMcpPanel(spec),
-      });
-    });
-    panelsGrid.appendChild(mcpBlock);
-
     // Reactively show/hide Pro-only UI blocks ("Create Interactive Widget" +
     // "Connect MCP" CTAs) based on premium access.
     //
@@ -1586,7 +1552,7 @@ export class PanelLayoutManager implements AppModule {
     // last (typically entitlements) is the one that flips the CTAs visible.
     // Mirrors the same dual-subscription wiring used by updatePanelGating
     // for existing panels (see lines ~259 and ~282).
-    const proBlocks = [proBlock, mcpBlock];
+    const proBlocks = [proBlock];
     const applyProBlockGating = (isPro: boolean) => {
       for (const block of proBlocks) {
         block.style.display = isPro ? '' : 'none';
@@ -1705,27 +1671,6 @@ export class PanelLayoutManager implements AppModule {
   addCustomWidget(spec: CustomWidgetSpec): void {
     saveWidget(spec);
     const panel = new CustomWidgetPanel(spec);
-    this.ctx.panels[spec.id] = panel;
-    this.ctx.panelSettings[spec.id] = { name: spec.title, enabled: true, priority: 3 };
-    saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
-    const el = panel.getElement();
-    this.makeDraggable(el, spec.id);
-    const grid = document.getElementById('panelsGrid');
-    if (grid) {
-      const addBlock = grid.querySelector('.add-panel-block');
-      if (addBlock) {
-        grid.insertBefore(el, addBlock);
-      } else {
-        grid.appendChild(el);
-      }
-    }
-    this.savePanelOrder();
-    this.applyPanelSettings();
-  }
-
-  addMcpPanel(spec: McpPanelSpec): void {
-    saveMcpPanel(spec);
-    const panel = new McpDataPanel(spec);
     this.ctx.panels[spec.id] = panel;
     this.ctx.panelSettings[spec.id] = { name: spec.title, enabled: true, priority: 3 };
     saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);

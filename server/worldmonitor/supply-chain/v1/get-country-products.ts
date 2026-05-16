@@ -6,7 +6,6 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/supply_chain/v1/service_server';
 import { ValidationError } from '../../../../src/generated/server/worldmonitor/supply_chain/v1/service_server';
 
-import { isCallerPremium } from '../../../_shared/premium-check';
 import { getCachedJson } from '../../../_shared/redis';
 
 interface BilateralHs4Payload {
@@ -16,7 +15,7 @@ interface BilateralHs4Payload {
 }
 
 export async function getCountryProducts(
-  ctx: ServerContext,
+  _ctx: ServerContext,
   req: GetCountryProductsRequest,
 ): Promise<GetCountryProductsResponse> {
   const iso2 = (req.iso2 ?? '').trim().toUpperCase();
@@ -30,9 +29,7 @@ export async function getCountryProducts(
     throw new ValidationError([{ field: 'iso2', description: 'iso2 must be a 2-letter uppercase ISO country code' }]);
   }
 
-  const isPro = await isCallerPremium(ctx.request);
   const empty: GetCountryProductsResponse = { iso2, products: [], fetchedAt: '' };
-  if (!isPro) return empty;
 
   // Seeder writes via raw key (no env-prefix) — match it on read.
   const key = `comtrade:bilateral-hs4:${iso2}:v1`;

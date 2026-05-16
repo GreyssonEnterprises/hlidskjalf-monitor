@@ -81,7 +81,7 @@ const PANEL_CLUSTER: Record<string, string> = {
   MilitaryCorrelation: 'panels-intel',
   Forecast: 'panels-intel',
   HeroSpotlight: 'panels-intel', Insights: 'panels-intel',
-  LiveWebcams: 'panels-intel', McpData: 'panels-intel',
+  LiveWebcams: 'panels-intel',
   Monitor: 'panels-intel', PinnedWebcams: 'panels-intel',
   Prediction: 'panels-intel', ProgressCharts: 'panels-intel',
   Regulation: 'panels-intel',
@@ -948,7 +948,6 @@ export default defineConfig(({ mode }) => {
           main: resolve(__dirname, 'index.html'),
           settings: resolve(__dirname, 'settings.html'),
           liveChannels: resolve(__dirname, 'live-channels.html'),
-          mcpGrant: resolve(__dirname, 'mcp-grant.html'),
         },
         output: {
           manualChunks(id) {

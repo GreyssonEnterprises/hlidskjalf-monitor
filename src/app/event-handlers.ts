@@ -4,9 +4,6 @@ import type { CustomWidgetPanel } from '@/components/CustomWidgetPanel';
 import { openWidgetChatModal } from '@/components/WidgetChatModal';
 import { deleteWidget, getWidget, saveWidget, isProUser } from '@/services/widget-store';
 import { FREE_MAX_PANELS, FREE_MAX_SOURCES } from '@/config/panels';
-import type { McpDataPanel } from '@/components/McpDataPanel';
-import { openMcpConnectModal } from '@/components/McpConnectModal';
-import { deleteMcpPanel, getMcpPanel, saveMcpPanel } from '@/services/mcp-store';
 import type { PanelConfig, MapLayers, MilitaryFlight } from '@/types';
 import type { MapView } from '@/components';
 import type { PositionSample } from '@/services/aviation';
@@ -387,18 +384,6 @@ export class EventHandlerManager implements AppModule {
         return;
       }
 
-      if (panelId.startsWith('mcp-')) {
-        if (!window.confirm(t('mcp.confirmDelete'))) return;
-        deleteMcpPanel(panelId);
-        const panel = this.ctx.panels[panelId];
-        panel?.destroy();
-        delete this.ctx.panels[panelId];
-        delete this.ctx.panelSettings[panelId];
-        saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
-        panel?.getElement()?.remove();
-        return;
-      }
-
       const config = this.ctx.panelSettings[panelId];
       if (!config) return;
       config.enabled = false;
@@ -425,18 +410,6 @@ export class EventHandlerManager implements AppModule {
       });
     }) as EventListener;
     this.ctx.container.addEventListener('wm:widget-modify', this.boundWidgetModifyHandler);
-
-    this.ctx.container.addEventListener('wm:mcp-configure', ((e: CustomEvent<{ panelId: string }>) => {
-      const spec = getMcpPanel(e.detail.panelId);
-      if (!spec) return;
-      openMcpConnectModal({
-        existingSpec: spec,
-        onComplete: (updated) => {
-          saveMcpPanel(updated);
-          (this.ctx.panels[updated.id] as McpDataPanel | undefined)?.updateSpec(updated);
-        },
-      });
-    }) as EventListener);
 
     // undo via Ctrl/Cmd+Z
     this.boundUndoHandler = (e: KeyboardEvent) => {

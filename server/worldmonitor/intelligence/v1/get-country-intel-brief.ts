@@ -7,7 +7,6 @@ import type {
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { UPSTREAM_TIMEOUT_MS, TIER1_COUNTRIES, sha256Hex } from './_shared';
 import { callLlm } from '../../../_shared/llm';
-import { isCallerPremium } from '../../../_shared/premium-check';
 import { sanitizeForPrompt } from '../../../_shared/llm-sanitize.js';
 import { ENERGY_SPINE_KEY_PREFIX } from '../../../_shared/cache-keys';
 
@@ -37,8 +36,7 @@ export async function getCountryIntelBrief(
     contextSnapshot = '';
   }
 
-  const isPremium = await isCallerPremium(ctx.request);
-  const frameworkRaw = isPremium && typeof req.framework === 'string' ? req.framework.slice(0, 2000) : '';
+  const frameworkRaw = typeof req.framework === 'string' ? req.framework.slice(0, 2000) : '';
 
   // Fetch energy mix early so its data-year can be included in the cache key.
   // This ensures cached briefs are invalidated when OWID publishes updated annual
